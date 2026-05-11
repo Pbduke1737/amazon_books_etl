@@ -1,0 +1,121 @@
+
+from airflow import DAG
+from datetime import datatime, timedelta
+from airflow.operator.python import PythonOpertor
+from airflow.providers.postgres.operators.postgres import PythonOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2026,5,4),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5)
+}
+
+def scrape_amazon_books(search_query, num_pages=1):
+    # Mimic a real browser to avoid immediate bot detection
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    books_data = []
+
+    for page in range(1, num_pages + 1):
+        url = f"https://www.amazon.com/s?k={search_query.replace(' ', '+')}&page={page}"
+        print(f"Fetching: {url}")
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code != 200:
+            print(f"Failed to retrieve page {page}. Status code: {response.status_code}")
+            continue
+
+        soup = BeautifulSoup(response.content, "html.parser")
+
+        # Amazon results are typically held in divs with this data-component
+        containers = soup.find_all("div", {"data-component-type": "s-search-result"})
+
+        for item in containers:
+            try:
+                # Selectors for Title, Price, and Rating
+                title_tag = item.h2.text.strip() if item.h2 else None
+
+                # Price is often split into whole and fraction
+                price_whole = item.find("span", "a-price-whole")
+                price_fraction = item.find("span", "a-price-fraction")
+                price = f"{price_whole.text}{price_fraction.text}" if price_whole else "N/A"
+
+                rating = item.find("span", "a-icon-alt")
+                rating_text = rating.text.strip() if rating else "No rating"
+
+                if title_tag:
+                    books_data.append({
+                        "Title": title_tag,
+                        "Price": price,
+                        "Rating": rating_text
+                    })
+            except Exception as e:
+                continue
+
+        # Respectful delay to prevent IP flagging
+        time.sleep(2)
+
+    # Convert to DataFrame
+    df = pd.DataFrame(books_data)
+    return df
+
+def insert_book_data_into_postgres(ti):
+    book_data = ti.xcom_pull(key='book_data', task_ids='fetch_book_data')
+    if not book_data:
+        raise ValueError("No book data found")
+
+    postgres_hook = PostgresHook(postgres_conn_id='books_connection')
+    insert_query = """
+    INSERT INTO books (title, price, rating)
+    VALUES (%s, %s, %s)
+    """
+    for book in book_data:
+        postgres_hook.run(insert_query, parameters=(book['Title'], book['Price'], book['Rating']))
+
+
+
+dag = DAG (
+    'fetch_and_transfrom_sales_data',
+    default_args=default_args,
+    descriptions='Dag to display whale users from a specific dataset',
+    schedule_interval=timedelta(days=1)
+)
+
+
+fetch_dataset = PythonOperator (
+    task_id='fetch_amazon_data',
+    python_callable=scrape_amazon_books,
+    op_args=['data engineering books'],
+    dag=dag,
+)
+
+create_table = PythonOperator(
+    task_id='create_table',
+    postgres_conn_id='amazon_books_connection',
+    sql = """
+    CREATE TABLE if not exists book (
+        id SERIAL PRIMARY KEY,
+        Title TEXT,
+        Price INT,
+        Rating INT,
+    );
+    """
+    dag=dag
+)
+
+load_file = PythonOperator (
+    task_id='load_table',
+    python_callable=insert_book_data_into_postgres,
+    dag=dag
+)
+
+
+
+fetch_dataset >> create_table >> load_file
